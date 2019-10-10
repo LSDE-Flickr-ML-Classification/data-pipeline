@@ -82,13 +82,7 @@ import os
 import pathlib
   
 dbutils.fs.rm(os.path.join(OUTPUT_DIR, "json_output"), recurse=True)
-
-# create sub dirs (not sure if works that way)
-#path = pathlib.Path(os.path.join(OUTPUT_DIR))
-#path.parent.mkdir(parents=True, exist_ok=True)
-
 dbutils.fs.mkdirs(os.path.join(OUTPUT_DIR, "json_output"))
-
 
 def write_file(part_id, output):
   output_path = "/dbfs" + os.path.join(OUTPUT_DIR, "json_output", "{0}.json".format(part_id) )
@@ -101,7 +95,13 @@ def write_file(part_id, output):
 write_output_udf = udf(lambda output: write_file(output[0], output[1]), StringType())
 result_df = partioned_df.withColumn("file_out", write_output_udf(struct('part_id', 'output')))
 
-result_df.show() # this invokes the udf
+# COMMAND ----------
+
+result_df.select("label", "part_id").write.parquet(os.path.join(OUTPUT_DIR, "label_output_mapping.parquet"))
+
+# COMMAND ----------
+
+label_output_mapping_df = spark.read.parquet(os.path.join(OUTPUT_DIR, "label_output_mapping.parquet"))
 
 # COMMAND ----------
 
@@ -110,56 +110,34 @@ print(file.read())
 
 # COMMAND ----------
 
+from pyspark.sql.functions import floor, concat_ws, col, asc, desc
 
-# get the amount of partions:
-#partions_num = partioned_df.count()
-# assign each partion
+inv_list_df = label_output_mapping_df.orderBy(["label", asc("part_id")]).groupBy(col("label")).agg(concat_ws("," , collect_list(col("part_id")) ).alias("part_id_arr")).orderBy(["label"])
 
-# create a new rdd:
-# partioned_df.select("part_id").show(100000)
+# COMMAND ----------
 
-#OUTFILE_PATH = os.path.join(OUTPUT_DIR, "txt", "sample")
+inv_list_df.printSchema()
+inv_list_df.show(1000)
 
-#output_df.show()
-# partitionBy(partions_num,lambda k: int(k[4]))
+# COMMAND ----------
 
-
-
-                     
-#valid_img_download_url_udf(df_raw_flickr["photo_video_download_url"]))
-
-#output_rdd.toDF().write.format("json").save(os.path.join(OUTPUT_DIR, "txt", "sample"))
-# output_rdd.partitionBy(partions_num).saveAsTextFile(os.path.join(OUTPUT_DIR, "txt", "sample"))
-# newpairRDD = pairRDD.partitionBy(5,lambda k: int(k[0]))
-
-
-# final_part_id = partioned_df.partitionBy("part_id")
-
-# 
-
-#
-# newpairRDD = pairRDD.partitionBy(5,lambda k: int(k[0]))
-
-# tdf.partitionBy(5).toDF().write.format("json").save(os.path.join(OUTPUT_DIR, "txt", "sample"))
-# tdf2 = tdf.toDF(['label', "output"]).groupBy(col("label")).agg(collect_list(col("output")).alias("output"))
+def json_invl_transform(row):
   
-  #  .write
-  #.format("json")
-  #.save("json/file/location/to/save")
-#print()
-#parts = tdf2.count()
-#tdf2.rdd.partitionBy(parts).saveAsTextFile(os.path.join(OUTPUT_DIR, "txt", "sample"))
+  str_val = "\"{0}\": [{1}]".format(row.label, row.part_id_arr) 
+  #row.label, row.part_id_arr
+  
+  return [str_val]
+
+output_rdd = inv_list_df.rdd.map(json_invl_transform)
+inverted_list_df = output_rdd.toDF(["value"])
 
 # COMMAND ----------
 
-#from pyspark.sql import functions as F
-# check: create folder for each tag
-# check: write (firt approach) one big json for everything
-# check: write chunked version
-#       -> chunk big json for each tag into serveral small ones
-# TODO: write inv list for all tags that were written (determine name of the chunks? ; )
-# --> create df which maps tag to chunckname -> transform that to a json-baed inv list
- # TODO: to satify the app interface: write index.json
+combined_df = inverted_list_df.coalesce(1).agg(concat_ws("," , collect_list(col("value")) ).alias("value"))
 
-# COMMAND ----------
+pyList = combined_df.collect()
 
+output_path = "/dbfs" + os.path.join(OUTPUT_DIR, "json_output", "inverted_list.json")
+out_file = open(output_path, "w")
+out_file.write( "{{{0}}}".format(pyList[0].value))
+out_file.close()
