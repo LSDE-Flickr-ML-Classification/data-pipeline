@@ -1,12 +1,14 @@
 # Databricks notebook source
 import json
 import os
+import urllib.parse
 from pyspark.sql.functions import desc, asc, monotonically_increasing_id, collect_list, col, dense_rank, row_number, lit,  floor, concat_ws, udf, struct
 from pyspark.sql.types import StructField, StringType, IntegerType, LongType, StructType, DateType, FloatType
 from pyspark.sql.window import Window
 
 OUTPUT_DIR = "/mnt/group07/classification_test_files/classification_test"
 LABEL_BUCKET_JSON_SIZE = 100
+PACKAGE_OUTPUT = True # Only for development?
 
 # COMMAND ----------
 
@@ -16,8 +18,25 @@ flickr_df = spark.read.parquet("/mnt/group07/full/flickr.parquet")
 
 # COMMAND ----------
 
+#label_df.show()
+from pyspark.sql.functions import *
+label_df= label_df.withColumn('label', regexp_replace('label', '_', ' '))
+
+# COMMAND ----------
+
+import pyspark.sql.functions as f
+label_df = label_df.withColumn("label",f.lower(f.col("label")))
+
+# COMMAND ----------
+
+import pyspark.sql.functions as func
+
+label_df = label_df.withColumn("confidence", func.round(label_df["confidence"],2))
+
+# COMMAND ----------
+
 # Combine the flickr dataset (specific cols only) and the classification result
-tags_wmeta_df = label_df.join(flickr_df.select("id", "photo_video_page_url", "title"), label_df.image_id == flickr_df.id).drop("id")
+tags_wmeta_df = label_df.join(flickr_df.select("id", "photo_video_page_url", "photo_video_download_url", "title"), label_df.image_id == flickr_df.id).drop("id")
 # Sort so confidence for each label is at the top
 tags_wmeta_df = tags_wmeta_df.orderBy([asc("label"), desc("confidence"), asc("image_id")])
 
@@ -28,12 +47,17 @@ tags_wmeta_df = tags_wmeta_df.withColumn("uniq_id", monotonically_increasing_id(
 
 # COMMAND ----------
 
+import urllib.parse
+
 def json_transform(row):
+  # TODO: Maybe shift some stuff to a preprocessing stuff? Unquote and + is space
+  title_decoded = "" if row.title == None else urllib.parse.unquote(row.title.replace("+", " "))
   result_dict = {
     "confidence": row.confidence,
     "image_id": "{0}".format(row.image_id),
     "flickr_url": "{0}".format(row.photo_video_page_url),
-    "title": "{0}".format(row.title)
+    "image_url": "{0}".format(row.photo_video_download_url),
+    "title": "{0}".format(title_decoded)
   }
 
   return [row.label, row.uniq_id, json.dumps(result_dict, sort_keys=True)]
@@ -93,6 +117,24 @@ label_output_mapping_df = spark.read.parquet(os.path.join(OUTPUT_DIR, "label_out
 
 # COMMAND ----------
 
+def json_prepare(row):
+    return ["\"{0}\"".format(row.label)]
+
+# Get all tags
+array_df = output_label_grouped_ids_df.select("label").orderBy("label").distinct()
+
+# Create the json output for each image and store as df
+final_label_array_rdd = array_df.rdd.map(json_prepare)
+final_label_array_df = final_label_array_rdd.toDF(["value"]).coalesce(1).agg(concat_ws("," , collect_list(col("value")) ).alias("value"))
+
+# Write all available tags
+output_path = "/dbfs" + os.path.join(OUTPUT_DIR, "json_output", "tag_list.json")
+out_file = open(output_path, "w")
+out_file.write( "[{0}]".format(final_label_array_df[0].value))
+out_file.close()
+
+# COMMAND ----------
+
 # Create the inverted list dataset
 inv_list_df = label_output_mapping_df.orderBy(["label", asc("part_id")]).groupBy(col("label")).agg(concat_ws("," , collect_list(col("part_id")) ).alias("part_id_arr")).orderBy(["label"])
 
@@ -117,3 +159,10 @@ output_path = "/dbfs" + os.path.join(OUTPUT_DIR, "json_output", "inverted_list.j
 out_file = open(output_path, "w")
 out_file.write( "{{{0}}}".format(inv_list_output_value_df[0].value))
 out_file.close()
+
+# COMMAND ----------
+
+# Package for easier download
+import shutil
+if PACKAGE_OUTPUT:
+  shutil.make_archive("/dbfs" + os.path.join(OUTPUT_DIR, "json_output"), 'tar', "/dbfs" + os.path.join(OUTPUT_DIR, "json_output"))
