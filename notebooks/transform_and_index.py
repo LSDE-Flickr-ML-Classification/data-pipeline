@@ -28,13 +28,15 @@
 import json
 import os
 import urllib.parse
-from pyspark.sql.functions import desc, asc, monotonically_increasing_id, collect_list, col, dense_rank, row_number, lit,  floor, concat_ws, udf, struct, max, sort_array, round
+from pyspark.sql.functions import desc, asc, monotonically_increasing_id, collect_list, col, dense_rank, row_number, lit,  floor, concat_ws, udf, struct, sort_array, round
+
+import pyspark.sql.functions as psf
 from pyspark.sql.types import StructField, StringType, IntegerType, LongType, StructType, DateType, FloatType, DoubleType
 from pyspark.sql.window import Window
 import shutil
 
 OUTPUT_DIR = "/mnt/group07/final_data_product/visualization/"
-LABEL_BUCKET_JSON_SIZE = 10000
+LABEL_BUCKET_JSON_SIZE = 30000 # -> should result in avg max 3MB partition
 MINIMUM_CONFIDENCE = 5
 PACKAGE_OUTPUT = True # Only for development?
 
@@ -49,9 +51,9 @@ PACKAGE_OUTPUT = True # Only for development?
 def get_at_least_one_label_per_img(input_df, min_confidence):
   img_id_window = Window.partitionBy(col('image_id'))
   # get for each image the label with the hightest confidence
-  top_values_per_label_df = input_df.select("image_id", "confidence").groupBy("image_id").agg(max("confidence").alias("confidence"))
+  top_values_per_label_df = input_df.select("image_id", "confidence").groupBy("image_id").agg(psf.max("confidence").alias("confidence"))
   top_labels_df = input_df.join(top_values_per_label_df, ["image_id", "confidence"]) # will result into multiple, if when ties exist
-  top_labels_df = input_df.withColumn('max_confidence', max('confidence').over(img_id_window)).where(col('confidence') == col('max_confidence')).drop("max_confidence")
+  top_labels_df = input_df.withColumn('max_confidence', psf.max('confidence').over(img_id_window)).where(col('confidence') == col('max_confidence')).drop("max_confidence")
   # only use labels with confidence larger than MINIMUM_CONFIDENCE
   labels_with_min_confidence_df = input_df.where(col("confidence") > min_confidence)
   # create a union (from the min confidence and the top -> distinct to reduce if top val exist twice due to union)
@@ -76,16 +78,16 @@ def get_labels_with_numeric_ids(input_df):
 # DBTITLE 1,Ingest raw data
 # Read both the classified images + the flickr dataset
 labels_df = spark.read.parquet("/mnt/group07/final_data_product/classification_result/labels.parquet")
-# image_id|               label|          confidence|
-downloaded_df = spark.read.parquet("/mnt/group07/final_data_product/classification_result/downloaded.parquet").limit(500000)
-# image_id
+
+downloaded_df = spark.read.parquet("/mnt/group07/final_data_product/classification_result/downloaded.parquet") # CURRENTLY NOT LIMIT .limit(50000)
+
 flickr_metadata_df = spark.read.parquet("/mnt/group07/final_data_product/visualization_input.parquet").withColumnRenamed("id", "image_id")
-# image_id|               title|   user_nsid|photo_video_farm_id|photo_video_server_id|photo_video_secret|photo_video_extension_original
 
 # COMMAND ----------
 
 # DBTITLE 1,Processing for Step 1.
 label_with_min_top_df = get_at_least_one_label_per_img(labels_df, MINIMUM_CONFIDENCE)
+
 # get labelled images ids:
 labelled_images_ids_df = label_with_min_top_df.select("image_id").distinct()
 # create a data product for all image ids and their labels
@@ -95,6 +97,9 @@ all_imgs_df = label_with_min_top_df.union(unclassified_label_df)
 
 # Reduce the images, acorrding to which have been downloaded:
 all_imgs_df = all_imgs_df.join(downloaded_df, "image_id")
+all_imgs_df.cache()
+
+print("Total records in final output: {0}".format(all_imgs_df.count()))
 
 # Add a unique id, to persist the sort order, and then reorder for joins
 labelled_imgs_wuid_df = all_imgs_df.orderBy([asc("label"), desc("confidence"), asc("image_id")]) \
@@ -197,18 +202,21 @@ group_row_mult = len(str(prepared_labelled_imgs_df.select("group_row_num").group
 bucketed_df = labelled_imgs_output_df \
                 .orderBy("uniq_id") \
                 .groupBy("label", "group_id", "group_row_num") \
-                .agg(concat_ws("," ,collect_list(col("output"))).alias("output")) \
+                .agg(concat_ws("," , collect_list(col("output"))).alias("output")) \
                 .withColumn("tmp_part_id",  (col("group_id") * int(10 ** group_row_mult)) + col("group_row_num")) \
                 .select("label", "output", "tmp_part_id")
 
 # Calculate final partition ids (will go to one single machine)
 partition_ids_df = bucketed_df.select("tmp_part_id").withColumn("partition", row_number().over(Window.orderBy("tmp_part_id")))
+partition_ids_df.cache()
 
+print("Final Amount of Partitions: {0}".format(partition_ids_df.count()))
+
+# COMMAND ----------
+
+# DBTITLE 1,Safety Stop: Check Output of Previous Cell -> Sure to write to disk?
 # join the calculated partition with the buckets dataframe
 partioned_df = bucketed_df.join(partition_ids_df, ["tmp_part_id"]).drop("tmp_part_id")
-
-# Count the amount of images per label
-imgs_per_label_count_df = prepared_labelled_imgs_df.groupBy("label").count().select("label", col("count").alias("img_cnt"))
 
 # Prepare a UDF that writes each bucket to storage
 write_output_udf = udf(lambda output: write_file(output.partition, output.output), LongType())
@@ -259,12 +267,16 @@ def write_to_disk(output_path, output):
 # DBTITLE 1,Ingest Data from Step 2
 # Read the previously created outputfile for post-processing (create inverted list)
 label_output_mapping_df = spark.read.parquet(os.path.join(OUTPUT_DIR, "label_output_mapping.parquet")).orderBy(["label", "partition"])
+prepared_labelled_imgs_df = spark.read.parquet(os.path.join(OUTPUT_DIR, "intermediate_tandi.parquet"))
+
+# Count the amount of images per label
+imgs_per_label_count_df = prepared_labelled_imgs_df.groupBy("label").count().select("label", col("count").alias("img_cnt"))
 
 # COMMAND ----------
 
 # DBTITLE 1,Create and Write Inverted List
 # Create the inverted list dataset
-inv_list_df = label_output_mapping_df.orderBy(["label", asc("partition")]).groupBy(col("label")).agg(concat_ws("," , collect_list(col("partition")) ).alias("part_id_arr")).orderBy(["label"])
+inv_list_df = label_output_mapping_df.orderBy(["label", asc("partition")]).groupBy(col("label")).agg(concat_ws("," , sort_array(collect_list(col("partition"))) ).alias("part_id_arr")).orderBy(["label"])
 
 # Add the total count of images per label
 inv_list_with_counts_df = inv_list_df.join(imgs_per_label_count_df, "label")
@@ -323,11 +335,38 @@ write_to_disk(
 
 # COMMAND ----------
 
-if PACKAGE_OUTPUT:
-  shutil.make_archive("/dbfs" + os.path.join(OUTPUT_DIR, "json_output"), 'tar', "/dbfs" + os.path.join(OUTPUT_DIR, "json_output"))
+#if PACKAGE_OUTPUT:
+#  shutil.make_archive("/dbfs" + os.path.join(OUTPUT_DIR, "json_output"), 'tar', "/dbfs" + os.path.join(OUTPUT_DIR, "json_output"))
 
 # COMMAND ----------
 
+import tarfile
+import os
+
+files = dbutils.fs.ls("/mnt/group07/final_data_product/visualization/json_output")
+
+dbutils.fs.rm(os.path.join(OUTPUT_DIR, "tar"), recurse=True)
+dbutils.fs.mkdirs(os.path.join(OUTPUT_DIR, "tar"))
+
+def chunks(l, n):
+    n = max(1, n)
+    return (l[i:i+n] for i in range(0, len(l), n))
+  
+for index, chunk in enumerate(chunks(files, 1000)):
+  print("creating tar from: {0}".format(index))
+  tar = tarfile.open("/dbfs" + os.path.join(OUTPUT_DIR, "tar", "{0}.tar".format(index)), 'x:bz2')
+  for file in chunk:
+    tar.add("/dbfs/" + file.path[6:])
+  tar.close()
+
+# COMMAND ----------
+
+#shutil.get_archive_formats()
+
+# COMMAND ----------
+
+#import os
+#os.remove("/dbfs" + os.path.join(OUTPUT_DIR, "json_output.tar"))
 # Drop Raw Files
-dbutils.fs.rm(os.path.join(OUTPUT_DIR, "json_output"), recurse=True)
-dbutils.fs.rm(os.path.join(OUTPUT_DIR, "intermediate_tandi.parquet"), recurse=True)
+#dbutils.fs.rm(os.path.join(OUTPUT_DIR, "json_output"), recurse=True)
+#dbutils.fs.rm(os.path.join(OUTPUT_DIR, "intermediate_tandi.parquet"), recurse=True)
